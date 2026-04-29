@@ -1,0 +1,117 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job 1: Testes e Build
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Instalar dependências
+      run: npm ci
+    
+    - name: Rodar testes
+      run: npm test -- --passWithNoTests --watchAll=false
+    
+    - name: Build do React
+      run: npm run build
+      env:
+        CI: false
+    
+    - name: Build da imagem Docker
+      run: docker build -t ${{ env.IMAGE_NAME }}:latest .
+    
+    - name: Salvar imagem como artefato
+      run: docker save ${{ env.IMAGE_NAME }}:latest > kubevision.tar
+    
+    - name: Upload artefato
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-image
+        path: kubevision.tar
+
+  # Job 2: Análise de Segurança
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+    
+    - name: Download artefato
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+    
+    - name: Carregar imagem
+      run: docker load < kubevision.tar
+    
+    - name: Scan de vulnerabilidades com Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'kubevision:latest'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload resultados
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Job 3: Deploy (opcional - para produção)
+  deploy:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+    
+    - name: Download artefato
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+    
+    - name: Carregar imagem
+      run: docker load < kubevision.tar
+    
+    - name: Login no GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Tag e Push da imagem
+      run: |
+        docker tag kubevision:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        docker tag kubevision:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+    
+    - name: Deploy no Kubernetes (se tiver cluster)
+      if: false  # Habilitar quando tiver cluster de produção
+      run: |
+        kubectl set image deployment/kubevision-dashboard \
+          dashboard=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          -n kubevision
